@@ -431,7 +431,7 @@ export default {
 		server.registerTool(
 			"delete_draft",
 			{
-				description: "Delete a draft (moves it to Trash). This is restricted to the Drafts folder only — it refuses to delete regular emails in any other folder (Inbox, Sent, etc.).",
+				description: "Delete a draft (moves it to Trash).",
 				inputSchema: {
 					messageId: z.string().describe("Zoho message ID of the draft to delete"),
 					folderId: z.string().describe("Zoho folder ID of the draft — must be the Drafts folder, otherwise the request is rejected"),
@@ -468,7 +468,7 @@ export default {
 		server.registerTool(
 			"edit_draft",
 			{
-				description: "Edit an existing draft. Zoho has no in-place draft update, so this saves a NEW draft with the provided content and then tries to delete the old one (mirroring how the web UI 'edits' a draft — the draft ID changes). Returns the new draft's messageId. Pass the full desired content; this is a replace, not a patch. For reply drafts, re-supply inReplyTo/refHeader to preserve threading.",
+				description: "Edit an existing draft, replacing its content. Pass the full desired content; this is a replace, not a patch. Returns the updated draft's messageId (it may differ from the original). For reply drafts, re-supply inReplyTo/refHeader to preserve threading.",
 				inputSchema: {
 					oldMessageId: z.string().describe("messageId of the existing draft to replace"),
 					oldFolderId: z.string().describe("folderId of the existing draft (usually the Drafts folder)"),
