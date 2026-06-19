@@ -165,3 +165,6 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+.DS_Store
+tail.log
