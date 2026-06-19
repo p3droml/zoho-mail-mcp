@@ -10,6 +10,8 @@ import {
 	extractRfcMessageId,
 	buildReplyHeaders,
 	extractThreadHeaders,
+	extractHeaderValue,
+	buildQuotedReplyHtml,
 	saveDraft,
 	getFolders,
 	listEmails,
@@ -45,6 +47,45 @@ export default {
 		async function withToken<T>(fn: (token: string, accountId: string) => Promise<T>): Promise<T> {
 			const token = await getAccessToken(env);
 			return fn(token, env.ZOHO_ACCOUNT_ID);
+		}
+
+		// Build the fields for a reply draft from the message being replied to:
+		// web-style quoted body, "Re:" subject, recipient, and threading headers.
+		async function assembleReply(
+			token: string,
+			accountId: string,
+			replyToFolderId: string,
+			replyToMessageId: string,
+			replyBodyHtml: string
+		): Promise<{ content: string; subject: string; toAddress: string; inReplyTo?: string; refHeader?: string }> {
+			const [details, original, headers] = await Promise.all([
+				getEmailDetails(token, accountId, replyToFolderId, replyToMessageId),
+				getEmailContent(token, accountId, replyToFolderId, replyToMessageId),
+				getEmailHeaders(token, accountId, replyToFolderId, replyToMessageId),
+			]);
+			const { inReplyTo, refHeader } = buildReplyHeaders(headers);
+			const date =
+				extractHeaderValue(headers, "Date") ??
+				new Date(parseInt(details.sentDateInGMT)).toUTCString();
+			const content = buildQuotedReplyHtml({
+				replyBodyHtml,
+				fromName: details.sender,
+				fromAddr: details.fromAddress,
+				to: details.toAddress,
+				date,
+				subject: details.subject,
+				originalBodyHtml: original.content,
+			});
+			const subject = /^re:/i.test(details.subject || "")
+				? details.subject
+				: `Re: ${details.subject}`;
+			return {
+				content,
+				subject,
+				toAddress: details.fromAddress,
+				inReplyTo: inReplyTo ?? undefined,
+				refHeader: refHeader ?? undefined,
+			};
 		}
 
 		// ─── Tool 1: Search Emails ──────────────────────────────────────────────────
@@ -279,16 +320,18 @@ export default {
 		server.registerTool(
 			"save_draft",
 			{
-				description: "Save a new draft email to the Drafts folder. Use this for composing new emails or reply drafts.",
+				description: "Save a draft to the Drafts folder, for a new email or a reply. To reply, set replyToMessageId + replyToFolderId and put ONLY your new message in `content` — the original is quoted, the subject is set to 'Re: …', the recipient defaults to the original sender, and threading is applied automatically (just like the web UI). For a new email, omit the replyTo fields and provide toAddress + subject.",
 				inputSchema: {
 					fromAddress: z.string().email().describe("Sender email address (e.g., 'pedro@knitlingo.com')"),
-					toAddress: z.string().describe("Recipient email address(es), comma-separated"),
-					subject: z.string().describe("Email subject line"),
-					content: z.string().describe("Email body content (HTML supported)"),
+					content: z.string().describe("Email body (HTML supported). For replies, this is ONLY your new message — do not include the quoted original; it is added automatically."),
+					toAddress: z.string().optional().describe("Recipient email address(es), comma-separated. Required for new emails. For replies it is optional and defaults to the original sender; set it to override (e.g. reply-all)."),
+					subject: z.string().optional().describe("Subject line. Required for new emails. For replies it defaults to 'Re: <original subject>'."),
+					replyToMessageId: z.string().optional().describe("To make this a reply: the messageId of the email being replied to (from search/read). Requires replyToFolderId."),
+					replyToFolderId: z.string().optional().describe("Folder ID of the email being replied to. Required when replyToMessageId is set."),
 					ccAddress: z.string().optional().describe("CC email address(es), comma-separated"),
 					bccAddress: z.string().optional().describe("BCC email address(es), comma-separated"),
-					inReplyTo: z.string().optional().describe("For replies: the `inReplyTo` value from get_email_headers (the RFC Message-ID of the email being replied to)."),
-					refHeader: z.string().optional().describe("For replies: the `refHeader` value from get_email_headers — the full thread chain (all prior Message-IDs + the replied-to message, space-separated, chronological). Required for correct threading in multi-message threads; do NOT just repeat inReplyTo."),
+					inReplyTo: z.string().optional().describe("Advanced override; normally unnecessary. When replyToMessageId is set, threading is derived automatically."),
+					refHeader: z.string().optional().describe("Advanced override; normally unnecessary. When replyToMessageId is set, the full thread chain is derived automatically."),
 					attachments: z.array(z.object({
 						storeName: z.string(),
 						attachmentName: z.string(),
@@ -305,9 +348,37 @@ export default {
 				})
 			},
 			async (params) => {
-				const result = await withToken((token, accountId) =>
-					saveDraft(token, accountId, params)
-				);
+				const result = await withToken(async (token, accountId) => {
+					const { replyToMessageId, replyToFolderId, ...rest } = params;
+
+					let { toAddress, subject, content, inReplyTo, refHeader } = rest;
+					if (replyToMessageId) {
+						if (!replyToFolderId) {
+							throw new Error("replyToFolderId is required when replyToMessageId is set.");
+						}
+						const reply = await assembleReply(token, accountId, replyToFolderId, replyToMessageId, content);
+						content = reply.content;
+						subject = subject ?? reply.subject;
+						toAddress = toAddress ?? reply.toAddress;
+						inReplyTo = inReplyTo ?? reply.inReplyTo;
+						refHeader = refHeader ?? reply.refHeader;
+					}
+
+					if (!toAddress) throw new Error("toAddress is required for a new email (no replyToMessageId).");
+					if (!subject) throw new Error("subject is required for a new email (no replyToMessageId).");
+
+					return saveDraft(token, accountId, {
+						fromAddress: rest.fromAddress,
+						toAddress,
+						subject,
+						content,
+						ccAddress: rest.ccAddress,
+						bccAddress: rest.bccAddress,
+						inReplyTo,
+						refHeader,
+						attachments: rest.attachments,
+					});
+				});
 
 				const structuredContent = {
 					messageId: result.messageId,
@@ -469,18 +540,20 @@ export default {
 		server.registerTool(
 			"edit_draft",
 			{
-				description: "Edit an existing draft, replacing its content. Pass the full desired content; this is a replace, not a patch. Returns the updated draft's messageId (it may differ from the original). Threading is preserved automatically for reply drafts; only pass inReplyTo/refHeader to change what the draft replies to.",
+				description: "Edit an existing draft, replacing its content. Returns the updated draft's messageId (it may differ from the original). For a reply draft, set replyToMessageId + replyToFolderId and put ONLY your new message in `content` — the quoted original, 'Re:' subject, recipient, and threading are rebuilt automatically. Otherwise `content` replaces the body verbatim and existing reply threading is preserved.",
 				inputSchema: {
 					oldMessageId: z.string().describe("messageId of the existing draft to replace"),
 					oldFolderId: z.string().describe("folderId of the existing draft (usually the Drafts folder)"),
 					fromAddress: z.string().email().describe("Sender email address"),
-					toAddress: z.string().describe("Recipient email address(es), comma-separated"),
-					subject: z.string().describe("Email subject line"),
-					content: z.string().describe("Full email body content (HTML supported). Replaces the old content entirely."),
+					content: z.string().describe("New email body (HTML supported). For replies (replyToMessageId set), this is ONLY your new message — the quoted original is added automatically. Otherwise it replaces the body entirely."),
+					toAddress: z.string().optional().describe("Recipient(s), comma-separated. Required unless replying (replyToMessageId set), where it defaults to the original sender."),
+					subject: z.string().optional().describe("Subject. Required unless replying, where it defaults to 'Re: <original subject>'."),
+					replyToMessageId: z.string().optional().describe("To rebuild this as a reply: messageId of the email being replied to. Requires replyToFolderId."),
+					replyToFolderId: z.string().optional().describe("Folder ID of the email being replied to. Required when replyToMessageId is set."),
 					ccAddress: z.string().optional().describe("CC email address(es), comma-separated"),
 					bccAddress: z.string().optional().describe("BCC email address(es), comma-separated"),
-					inReplyTo: z.string().optional().describe("Optional override. Threading is inherited from the existing draft automatically; only set this (with refHeader) to change what the draft replies to."),
-					refHeader: z.string().optional().describe("Optional override (full thread chain from get_email_headers). Only set this together with inReplyTo to change what the draft replies to."),
+					inReplyTo: z.string().optional().describe("Advanced override; normally unnecessary."),
+					refHeader: z.string().optional().describe("Advanced override; normally unnecessary."),
 					attachments: z.array(z.object({
 						storeName: z.string(),
 						attachmentName: z.string(),
@@ -497,23 +570,48 @@ export default {
 					oldDraftDeleted: z.boolean()
 				})
 			},
-			async ({ oldMessageId, oldFolderId, ...draft }) => {
+			async ({ oldMessageId, oldFolderId, replyToMessageId, replyToFolderId, ...rest }) => {
 				const { result, oldDraftDeleted } = await withToken(async (token, accountId) => {
-					// Preserve threading automatically: if the caller didn't pass threading
-					// headers, inherit them from the draft being edited so reply threads stay intact.
-					if (draft.inReplyTo === undefined && draft.refHeader === undefined) {
+					let { toAddress, subject, content, inReplyTo, refHeader } = rest;
+
+					if (replyToMessageId) {
+						// Rebuild as a reply: quote the original and derive subject/recipient/threading.
+						if (!replyToFolderId) {
+							throw new Error("replyToFolderId is required when replyToMessageId is set.");
+						}
+						const reply = await assembleReply(token, accountId, replyToFolderId, replyToMessageId, content);
+						content = reply.content;
+						subject = subject ?? reply.subject;
+						toAddress = toAddress ?? reply.toAddress;
+						inReplyTo = inReplyTo ?? reply.inReplyTo;
+						refHeader = refHeader ?? reply.refHeader;
+					} else if (inReplyTo === undefined && refHeader === undefined) {
+						// Plain edit: preserve threading by inheriting it from the draft being edited.
 						try {
 							const headers = await getEmailHeaders(token, accountId, oldFolderId, oldMessageId);
 							const carried = extractThreadHeaders(headers);
-							draft.inReplyTo = carried.inReplyTo ?? undefined;
-							draft.refHeader = carried.refHeader ?? undefined;
+							inReplyTo = carried.inReplyTo ?? undefined;
+							refHeader = carried.refHeader ?? undefined;
 						} catch {
 							// Not a threaded draft or headers unavailable — save without threading.
 						}
 					}
 
+					if (!toAddress) throw new Error("toAddress is required unless replying (replyToMessageId not set).");
+					if (!subject) throw new Error("subject is required unless replying (replyToMessageId not set).");
+
 					// Save the new draft FIRST so content is never lost if the delete fails.
-					const result = await saveDraft(token, accountId, draft);
+					const result = await saveDraft(token, accountId, {
+						fromAddress: rest.fromAddress,
+						toAddress,
+						subject,
+						content,
+						ccAddress: rest.ccAddress,
+						bccAddress: rest.bccAddress,
+						inReplyTo,
+						refHeader,
+						attachments: rest.attachments,
+					});
 					let oldDraftDeleted = false;
 					try {
 						// Safety guard: only remove the old message if it's actually in Drafts,

@@ -151,7 +151,7 @@ export function extractRfcMessageId(headerContent: string): string | null {
 }
 
 /** Extract a (possibly line-folded) header's raw value by name. */
-function extractHeaderValue(headerContent: string, name: string): string | null {
+export function extractHeaderValue(headerContent: string, name: string): string | null {
 	// Capture the value across RFC 5322 folded continuation lines (lines starting with whitespace).
 	const re = new RegExp(`^${name}:\\s*([\\s\\S]*?)(?=\\n[^\\s]|$)`, "im");
 	const m = headerContent.match(re);
@@ -204,6 +204,59 @@ export function extractThreadHeaders(headerContent: string): {
 		inReplyTo: inReplyTo[0] ?? null,
 		refHeader: refs.length ? refs.join(" ") : null,
 	};
+}
+
+function escapeHtml(s: string): string {
+	return s
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+function unescapeHtml(s: string): string {
+	return s
+		.replace(/&quot;/g, '"')
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&amp;/g, "&");
+}
+
+/**
+ * Build a reply body that matches the Zoho web UI: the new reply text on top,
+ * a separator rule, a From/To/Date/Subject header block, then the original
+ * message quoted in a blockquote. (Signature is intentionally not added.)
+ */
+export function buildQuotedReplyHtml(opts: {
+	replyBodyHtml: string;
+	fromName: string;
+	fromAddr: string;
+	to: string;
+	date: string;
+	subject: string;
+	originalBodyHtml: string;
+}): string {
+	const fromName = escapeHtml(unescapeHtml(opts.fromName || ""));
+	const fromAddr = escapeHtml(opts.fromAddr || "");
+	const to = escapeHtml(unescapeHtml(opts.to || ""));
+	const subject = escapeHtml(unescapeHtml(opts.subject || ""));
+	const date = escapeHtml(opts.date || "");
+
+	return (
+		`<div><div style="font-family: Verdana, Arial, Helvetica, sans-serif; font-size: 10pt">` +
+		`<div>${opts.replyBodyHtml}</div>` +
+		`<div><br></div>` +
+		`<div class="zmail_extra_hr" style="border-top: 1px solid rgb(204, 204, 204); min-height: 0px; margin-top: 10px; margin-bottom: 10px; line-height: 0px"><br></div>` +
+		`<div class="zmail_extra"><div><br></div><div>` +
+		`From: ${fromName} &lt;<a href="mailto:${fromAddr}" target="_blank">${fromAddr}</a>&gt;<br>` +
+		`To: ${to}<br>` +
+		`Date: ${date}<br>` +
+		`Subject: ${subject}<br></div>` +
+		`<div><br></div>` +
+		`<blockquote style="margin: 0px">${opts.originalBodyHtml}</blockquote>` +
+		`</div><div><br></div>` +
+		`</div></div>`
+	);
 }
 
 export interface AttachmentInfo {
