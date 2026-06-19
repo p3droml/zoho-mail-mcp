@@ -9,6 +9,7 @@ import {
 	getEmailHeaders,
 	extractRfcMessageId,
 	buildReplyHeaders,
+	extractThreadHeaders,
 	saveDraft,
 	getFolders,
 	listEmails,
@@ -468,7 +469,7 @@ export default {
 		server.registerTool(
 			"edit_draft",
 			{
-				description: "Edit an existing draft, replacing its content. Pass the full desired content; this is a replace, not a patch. Returns the updated draft's messageId (it may differ from the original). For reply drafts, re-supply inReplyTo/refHeader to preserve threading.",
+				description: "Edit an existing draft, replacing its content. Pass the full desired content; this is a replace, not a patch. Returns the updated draft's messageId (it may differ from the original). Threading is preserved automatically for reply drafts; only pass inReplyTo/refHeader to change what the draft replies to.",
 				inputSchema: {
 					oldMessageId: z.string().describe("messageId of the existing draft to replace"),
 					oldFolderId: z.string().describe("folderId of the existing draft (usually the Drafts folder)"),
@@ -478,8 +479,8 @@ export default {
 					content: z.string().describe("Full email body content (HTML supported). Replaces the old content entirely."),
 					ccAddress: z.string().optional().describe("CC email address(es), comma-separated"),
 					bccAddress: z.string().optional().describe("BCC email address(es), comma-separated"),
-					inReplyTo: z.string().optional().describe("For reply drafts: the `inReplyTo` from get_email_headers."),
-					refHeader: z.string().optional().describe("For reply drafts: the `refHeader` from get_email_headers (full thread chain)."),
+					inReplyTo: z.string().optional().describe("Optional override. Threading is inherited from the existing draft automatically; only set this (with refHeader) to change what the draft replies to."),
+					refHeader: z.string().optional().describe("Optional override (full thread chain from get_email_headers). Only set this together with inReplyTo to change what the draft replies to."),
 					attachments: z.array(z.object({
 						storeName: z.string(),
 						attachmentName: z.string(),
@@ -498,6 +499,19 @@ export default {
 			},
 			async ({ oldMessageId, oldFolderId, ...draft }) => {
 				const { result, oldDraftDeleted } = await withToken(async (token, accountId) => {
+					// Preserve threading automatically: if the caller didn't pass threading
+					// headers, inherit them from the draft being edited so reply threads stay intact.
+					if (draft.inReplyTo === undefined && draft.refHeader === undefined) {
+						try {
+							const headers = await getEmailHeaders(token, accountId, oldFolderId, oldMessageId);
+							const carried = extractThreadHeaders(headers);
+							draft.inReplyTo = carried.inReplyTo ?? undefined;
+							draft.refHeader = carried.refHeader ?? undefined;
+						} catch {
+							// Not a threaded draft or headers unavailable — save without threading.
+						}
+					}
+
 					// Save the new draft FIRST so content is never lost if the delete fails.
 					const result = await saveDraft(token, accountId, draft);
 					let oldDraftDeleted = false;

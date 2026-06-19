@@ -189,6 +189,23 @@ export function buildReplyHeaders(headerContent: string): {
 	};
 }
 
+/**
+ * Read the thread headers already present on a message (e.g. a reply draft),
+ * so they can be carried over verbatim when the draft is re-saved. Returns the
+ * draft's own In-Reply-To and References, NOT a reply derived from it.
+ */
+export function extractThreadHeaders(headerContent: string): {
+	inReplyTo: string | null;
+	refHeader: string | null;
+} {
+	const inReplyTo = extractMessageIds(extractHeaderValue(headerContent, "In-Reply-To"));
+	const refs = extractMessageIds(extractHeaderValue(headerContent, "References"));
+	return {
+		inReplyTo: inReplyTo[0] ?? null,
+		refHeader: refs.length ? refs.join(" ") : null,
+	};
+}
+
 export interface AttachmentInfo {
 	attachmentId: string;
 	attachmentName: string;
