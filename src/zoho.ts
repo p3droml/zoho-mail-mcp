@@ -279,8 +279,20 @@ export async function getAttachmentList(
 		throw new Error(`Failed to get attachment info: ${text}`);
 	}
 
-	const json = (await res.json()) as { data: AttachmentInfo[] };
-	return json.data ?? [];
+	const json = (await res.json()) as {
+		data?: {
+			attachments?: any[];
+			inlineAttachments?: any[];
+		};
+	};
+
+	const attachments = json.data?.attachments ?? [];
+	return attachments.map((att: any) => ({
+		attachmentId: String(att.attachmentId ?? att.attachmentID ?? ""),
+		attachmentName: String(att.attachmentName ?? ""),
+		attachmentSize: String(att.attachmentSize ?? "0"),
+		isInline: String(att.isInline ?? "false"),
+	}));
 }
 
 export async function downloadAttachment(
