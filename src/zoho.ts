@@ -19,8 +19,63 @@ interface ZohoTokenResponse {
 	expires_in: number;
 }
 
+export class ZohoApiError extends Error {
+	constructor(public status: number, message: string) {
+		super(message);
+		this.name = "ZohoApiError";
+	}
+}
+
+/**
+ * Custom fetch wrapper that retries on transient errors (429 and 5xx).
+ */
+export async function fetchWithRetry(
+	url: string | URL,
+	init?: RequestInit,
+	maxRetries = 3,
+	baseDelayMs = 1000
+): Promise<Response> {
+	let lastError: any;
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			const res = await fetch(url, init);
+			// Retry on 429 (Too Many Requests) or 5xx server errors
+			if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+				if (attempt < maxRetries) {
+					const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 100;
+					await new Promise((resolve) => setTimeout(resolve, delay));
+					continue;
+				}
+			}
+			return res;
+		} catch (err) {
+			lastError = err;
+			if (attempt < maxRetries) {
+				const delay = baseDelayMs * Math.pow(2, attempt) + Math.random() * 100;
+				await new Promise((resolve) => setTimeout(resolve, delay));
+				continue;
+			}
+		}
+	}
+	throw lastError || new Error(`Request failed after ${maxRetries} retries`);
+}
+
+// Cache tokens in memory to avoid token refresh requests on every tool call.
+// Map key: refresh_token, value: { accessToken: string, expiresAt: number }
+const tokenCache = new Map<string, { accessToken: string; expiresAt: number }>();
+
+export function clearCachedToken(refreshToken: string): void {
+	tokenCache.delete(refreshToken);
+}
+
 export async function getAccessToken(env: ZohoEnv): Promise<string> {
-	const res = await fetch(ZOHO_ACCOUNTS_URL, {
+	const cacheKey = env.ZOHO_REFRESH_TOKEN;
+	const cached = tokenCache.get(cacheKey);
+	if (cached && cached.expiresAt > Date.now()) {
+		return cached.accessToken;
+	}
+
+	const res = await fetchWithRetry(ZOHO_ACCOUNTS_URL, {
 		method: "POST",
 		headers: { "Content-Type": "application/x-www-form-urlencoded" },
 		body: new URLSearchParams({
@@ -33,10 +88,14 @@ export async function getAccessToken(env: ZohoEnv): Promise<string> {
 
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get Zoho access token: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get Zoho access token: ${text}`);
 	}
 
 	const data = (await res.json()) as ZohoTokenResponse;
+	tokenCache.set(cacheKey, {
+		accessToken: data.access_token,
+		expiresAt: Date.now() + data.expires_in * 1000 - 60000, // 1 minute buffer
+	});
 	return data.access_token;
 }
 
@@ -67,10 +126,10 @@ export async function searchEmails(
 	url.searchParams.set("searchKey", searchKey);
 	url.searchParams.set("limit", String(limit));
 
-	const res = await fetch(url.toString(), { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url.toString(), { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Search failed: ${text}`);
+		throw new ZohoApiError(res.status, `Search failed: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: EmailSummary[] };
@@ -89,10 +148,10 @@ export async function getEmailContent(
 	messageId: string
 ): Promise<EmailContent> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}/content`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get email content: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get email content: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: EmailContent };
@@ -118,10 +177,10 @@ export async function getEmailDetails(
 	messageId: string
 ): Promise<EmailDetails> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}/details`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get email details: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get email details: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: EmailDetails };
@@ -135,10 +194,10 @@ export async function getEmailHeaders(
 	messageId: string
 ): Promise<string> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}/header`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get email headers: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get email headers: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: { headerContent: string } };
@@ -273,10 +332,10 @@ export async function getAttachmentList(
 	messageId: string
 ): Promise<AttachmentInfo[]> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}/attachmentinfo`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get attachment info: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get attachment info: ${text}`);
 	}
 
 	const json = (await res.json()) as {
@@ -303,10 +362,10 @@ export async function downloadAttachment(
 	attachmentId: string
 ): Promise<string> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}/attachments/${attachmentId}`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to download attachment: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to download attachment: ${text}`);
 	}
 
 	const arrayBuffer = await res.arrayBuffer();
@@ -340,7 +399,7 @@ export async function uploadAttachment(
 		bytes[i] = binaryString.charCodeAt(i);
 	}
 
-	const res = await fetch(url.toString(), {
+	const res = await fetchWithRetry(url.toString(), {
 		method: "POST",
 		headers: {
 			...authHeaders(token),
@@ -351,7 +410,7 @@ export async function uploadAttachment(
 
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to upload attachment: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to upload attachment: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: UploadedAttachmentInfo[] };
@@ -405,7 +464,7 @@ export async function saveDraft(
 		body.attachments = params.attachments;
 	}
 
-	const res = await fetch(url, {
+	const res = await fetchWithRetry(url, {
 		method: "POST",
 		headers: {
 			...authHeaders(token),
@@ -416,7 +475,7 @@ export async function saveDraft(
 
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to save draft: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to save draft: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: DraftResult };
@@ -430,10 +489,10 @@ export interface FolderInfo {
 
 export async function getFolders(token: string, accountId: string): Promise<FolderInfo[]> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders`;
-	const res = await fetch(url, { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to get folders: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to get folders: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: FolderInfo[] };
@@ -450,10 +509,10 @@ export async function listEmails(
 	url.searchParams.set("folderId", folderId);
 	url.searchParams.set("limit", String(limit));
 
-	const res = await fetch(url.toString(), { headers: authHeaders(token) });
+	const res = await fetchWithRetry(url.toString(), { headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to list emails: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to list emails: ${text}`);
 	}
 
 	const json = (await res.json()) as { data: EmailSummary[] };
@@ -471,9 +530,9 @@ export async function deleteEmail(
 	messageId: string
 ): Promise<void> {
 	const url = `${ZOHO_MAIL_BASE}/accounts/${accountId}/folders/${folderId}/messages/${messageId}`;
-	const res = await fetch(url, { method: "DELETE", headers: authHeaders(token) });
+	const res = await fetchWithRetry(url, { method: "DELETE", headers: authHeaders(token) });
 	if (!res.ok) {
 		const text = await res.text();
-		throw new Error(`Failed to delete email: ${text}`);
+		throw new ZohoApiError(res.status, `Failed to delete email: ${text}`);
 	}
 }

@@ -19,6 +19,8 @@ import {
 	downloadAttachment,
 	uploadAttachment,
 	deleteEmail,
+	ZohoApiError,
+	clearCachedToken,
 } from "./zoho";
 import type { ZohoEnv } from "./zoho";
 
@@ -45,8 +47,17 @@ export default {
 		});
 
 		async function withToken<T>(fn: (token: string, accountId: string) => Promise<T>): Promise<T> {
-			const token = await getAccessToken(env);
-			return fn(token, env.ZOHO_ACCOUNT_ID);
+			let token = await getAccessToken(env);
+			try {
+				return await fn(token, env.ZOHO_ACCOUNT_ID);
+			} catch (error) {
+				if (error instanceof ZohoApiError && error.status === 401) {
+					clearCachedToken(env.ZOHO_REFRESH_TOKEN);
+					token = await getAccessToken(env);
+					return await fn(token, env.ZOHO_ACCOUNT_ID);
+				}
+				throw error;
+			}
 		}
 
 		// Build the fields for a reply draft from the message being replied to:
